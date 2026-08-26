@@ -11,6 +11,8 @@ local.
 import argparse
 import logging
 import socket
+import time
+from collections import Counter
 
 import trio
 
@@ -59,15 +61,16 @@ async def probe(ifname, keys_path, duration):
     monitor = ExistingMonitor(ifname)
     await monitor.activate()
     scanner = ldn.Scanner(protocols, monitor)
-    count = 0
+    received_at = []
+    started_at = time.monotonic()
     try:
         with trio.move_on_after(duration):
             while True:
                 await scanner.receive()
-                count += 1
+                received_at.append(time.monotonic() - started_at)
     finally:
         monitor.close()
-    return count
+    return received_at
 
 
 def main():
@@ -76,13 +79,20 @@ def main():
     parser.add_argument("--keys", required=True, help="absolute path to prod.keys")
     parser.add_argument("--duration", type=float, default=12.0, metavar="SECONDS",
                         help="receive window (default: 12)")
+    parser.add_argument("--per-second", action="store_true",
+                        help="report only aggregate counts by elapsed second")
     args = parser.parse_args()
     if args.duration <= 0:
         parser.error("--duration must be positive")
 
     logging.getLogger("ldn").setLevel(logging.ERROR)
-    count = trio.run(probe, args.iface, args.keys, args.duration)
-    print(f"decodable LDN advertisements on {args.iface}: {count}")
+    received_at = trio.run(probe, args.iface, args.keys, args.duration)
+    print(f"decodable LDN advertisements on {args.iface}: {len(received_at)}")
+    if args.per_second:
+        counts = Counter(int(elapsed) for elapsed in received_at)
+        print("per-second counts: " + " ".join(
+            f"{second}:{counts[second]}" for second in range(int(args.duration))
+        ))
 
 
 if __name__ == "__main__":

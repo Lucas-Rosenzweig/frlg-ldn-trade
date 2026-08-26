@@ -12,10 +12,15 @@ LiveTransport   - LIVE. Joins the FRLG console's LDN session with kinnay's `ldn`
                   exercised offline, so it is written to mirror the proven bridge code path.
 """
 
+import base64
 import json
+import os
+import shutil
 import socket
 import struct
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -23,6 +28,7 @@ import traceback
 ETH_P_IP = 0x0800
 PROTO_UDP = 17
 PIA_PORT = 12345
+_MONITOR_IPC_LIMIT = 65536
 
 
 _PIA_HDR = 0x5C     # Pia 6.16-6.41 LDN system header (sysCommVer 21/22); the game payload follows it
@@ -282,6 +288,146 @@ class ReplayTransport:
 
 
 # ---------------------------------------------------------------------------
+class MonitorHelperError(RuntimeError):
+    """The separate AX200 monitor helper could not provide a safe IPC stream."""
+
+
+class _MonitorAdvertisementSource:
+    """Strict line-delimited JSON reader passed to the vendored LDN fork."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer = bytearray()
+        self.received = 0
+
+    async def _message(self):
+        while b"\n" not in self._buffer:
+            chunk = await self._stream.receive_some(_MONITOR_IPC_LIMIT)
+            if not chunk:
+                raise MonitorHelperError("monitor helper disconnected")
+            self._buffer.extend(chunk)
+            if len(self._buffer) > _MONITOR_IPC_LIMIT:
+                raise MonitorHelperError("monitor helper sent an oversized message")
+        raw, _, rest = self._buffer.partition(b"\n")
+        self._buffer = bytearray(rest)
+        if not raw or len(raw) > _MONITOR_IPC_LIMIT:
+            raise MonitorHelperError("monitor helper sent an invalid message length")
+        try:
+            message = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise MonitorHelperError("monitor helper sent invalid JSON") from e
+        if not isinstance(message, dict) or message.get("version") != 1:
+            raise MonitorHelperError("monitor helper sent an unsupported message")
+        return message
+
+    async def expect_ready(self):
+        message = await self._message()
+        if message != {"version": 1, "type": "ready"}:
+            raise MonitorHelperError("monitor helper did not send ready")
+
+    async def receive_advertisement(self):
+        message = await self._message()
+        if message.get("type") != "advertisement":
+            raise MonitorHelperError("monitor helper sent an unexpected message")
+        source = message.get("source")
+        frequency = message.get("frequency")
+        action = message.get("action")
+        if not isinstance(source, str) or len(source) != 12:
+            raise MonitorHelperError("monitor helper sent an invalid source")
+        if not isinstance(frequency, int) or frequency <= 0:
+            raise MonitorHelperError("monitor helper sent an invalid frequency")
+        if not isinstance(action, str):
+            raise MonitorHelperError("monitor helper sent an invalid action")
+        try:
+            source_bytes = bytes.fromhex(source)
+            action_bytes = base64.b64decode(action, validate=True)
+        except ValueError as e:
+            raise MonitorHelperError("monitor helper sent malformed advertisement data") from e
+        if len(source_bytes) != 6 or not action_bytes:
+            raise MonitorHelperError("monitor helper sent malformed advertisement fields")
+        self.received += 1
+        return source_bytes, frequency, action_bytes
+
+    async def aclose(self):
+        await self._stream.aclose()
+
+
+class _MonitorHelper:
+    """Own a private Unix listener and the process feeding its LDN stream."""
+
+    def __init__(self, ifname, keys_path):
+        self.ifname = ifname
+        self.keys_path = keys_path
+        self.runtime_dir = None
+        self.listener = None
+        self.process = None
+        self.source = None
+
+    async def start(self):
+        import trio
+
+        self.runtime_dir = tempfile.mkdtemp(prefix="frlg-ldn-monitor-")
+        os.chmod(self.runtime_dir, 0o700)
+        socket_path = os.path.join(self.runtime_dir, "monitor.sock")
+        self.listener = trio.socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        await self.listener.bind(socket_path)
+        self.listener.listen(1)
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        child_env = os.environ.copy()
+        old_path = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = project_root + (os.pathsep + old_path if old_path else "")
+        command = [sys.executable, "-m", "frlgsim.monitor_helper", "--socket", socket_path,
+                   "--iface", self.ifname, "--keys", self.keys_path]
+        self.process = await trio.lowlevel.open_process(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, cwd=project_root, env=child_env,
+        )
+
+        client = None
+        with trio.move_on_after(5) as scope:
+            client, _ = await self.listener.accept()
+        if scope.cancelled_caught or client is None:
+            raise MonitorHelperError("monitor helper did not connect within 5 seconds")
+        try:
+            _pid, uid, _gid = struct.unpack("3i", client.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, 12
+            ))
+        except OSError as e:
+            client.close()
+            raise MonitorHelperError("could not verify monitor helper peer") from e
+        if uid != os.geteuid():
+            client.close()
+            raise MonitorHelperError("monitor helper peer has an unexpected uid")
+        self.source = _MonitorAdvertisementSource(trio.SocketStream(client))
+        with trio.move_on_after(5) as scope:
+            await self.source.expect_ready()
+        if scope.cancelled_caught:
+            raise MonitorHelperError("monitor helper did not become ready within 5 seconds")
+        return self.source
+
+    async def aclose(self):
+        if self.source is not None:
+            await self.source.aclose()
+            self.source = None
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
+        if self.process is not None and self.process.returncode is None:
+            self.process.terminate()
+            import trio
+            with trio.move_on_after(2) as scope:
+                await self.process.wait()
+            if scope.cancelled_caught and self.process.returncode is None:
+                self.process.kill()
+                await self.process.wait()
+        self.process = None
+        if self.runtime_dir is not None:
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
+            self.runtime_dir = None
+
+
+# ---------------------------------------------------------------------------
 class LiveTransport:
     """Join the console's LDN session and exchange UDP :12345 datagrams. Mirrors the bridge
     (scan/connect + UDP TX socket + AF_PACKET RX). Untested offline."""
@@ -378,8 +524,26 @@ class LiveTransport:
 
         async def main():
             keys = ldn.load_keys(self.keys_path)
+            helper = None
+            if self.monitor_ifname is not None:
+                helper = _MonitorHelper(self.monitor_ifname, self.keys_path)
+                try:
+                    await helper.start()
+                except BaseException:
+                    await helper.aclose()
+                    raise
             self.info("Scanning for the FRLG network...")
-            networks = await ldn.scan(keys, phyname=self.phyname)
+            # The AX200 monitor path can see advertisements less frequently than
+            # LDN's 110 ms default dwell.  Keep the established fast scan for
+            # normal adapters, but give each channel a full second when the
+            # monitor helper is explicitly requested.
+            dwell_time = 1.0 if self.monitor_ifname is not None else .110
+            try:
+                networks = await ldn.scan(keys, phyname=self.phyname, dwell_time=dwell_time)
+            except BaseException:
+                if helper is not None:
+                    await helper.aclose()
+                raise
             joinable = [n for n in networks
                         if n.accept_policy != ldn.ACCEPT_NONE
                         and n.num_participants < n.max_participants]
@@ -400,6 +564,8 @@ class LiveTransport:
             if net is None:
                 self._err = (f"no joinable FRLG network (saw {len(networks)}, "
                              f"{len(joinable)} joinable) - set --comm-id from the list above")
+                if helper is not None:
+                    await helper.aclose()
                 self._ready.set()
                 return
             self.LOCAL_COMMUNICATION_ID = net.local_communication_id
@@ -415,39 +581,37 @@ class LiveTransport:
             param.app_version = self.APPLICATION_VERSION
             param.phyname = self.phyname              # wifi phy (like the bridge: phy0)
             param.ifname = self.ifname                # station iface (like the bridge: ldnclient)
-            param.ifname_monitor = self.monitor_ifname
-            self.info("Joining the host...")
-            async with ldn.connect(param) as network:
-                info = network.info()
-                self.ssid = info.ssid
-                self.iface = self.ifname
-                # The host is participant 0 (the network creator); its IP fixes the 169.254.X subnet
-                # [ldn/__init__.py NetworkInfo.participants; the bridge's network_nodes]. Each
-                # ParticipantInfo carries ip_address + mac_address (the 6-byte LDN MAC = the Pia
-                # connection GUID). We are the participant whose name matches our nickname (we set
-                # param.name); fall back to the first connected non-host, then to subnet .2.
-                parts = list(getattr(info, "participants", []) or [])
-                host = parts[0] if parts else None
-                self.host_ip = host.ip_address if host else "169.254.21.1"
-                self.host_mac = bytes(host.mac_address) if host else b"\x00" * 6
-                ours = next((p for p in parts if p is not host and self._pname(p) == self.nickname),
-                            None) or next((p for p in parts if p is not host
-                                           and getattr(p, "connected", False)), None)
-                # our IP: prefer the address the ldn lib actually assigned to the iface (ground
-                # truth) over the participant list; broadcast is OUR subnet's .255 (= where the host
-                # broadcasts its Net 0x11). [the reference capture seq 1: host -> 169.254.X.255]
-                self.our_ip = (self._iface_ip() or (ours.ip_address if ours else None)
-                               or self.host_ip.rsplit(".", 1)[0] + ".2")
-                self.our_mac = ((bytes(ours.mac_address) if ours else None)
-                                or self._iface_mac() or b"\x00" * 6)
-                self.broadcast = self.our_ip.rsplit(".", 1)[0] + ".255"
-                self.log(f"[live] joined ssid={self.ssid.hex()} "
-                         f"us={self.our_ip}/{self.our_mac.hex()} "
-                         f"host={self.host_ip}/{self.host_mac.hex()}")
-                self.info("Joined.")
-                self._ready.set()
-                while not self._stop.is_set():
-                    await trio.sleep(0.2)
+            try:
+                if self.monitor_ifname is not None:
+                    param.advertisement_source = helper.source
+                self.info("Joining the host...")
+                async with ldn.connect(param) as network:
+                    info = network.info()
+                    self.ssid = info.ssid
+                    self.iface = self.ifname
+                    # The host is participant 0 (the network creator); its IP fixes the 169.254.X subnet.
+                    parts = list(getattr(info, "participants", []) or [])
+                    host = parts[0] if parts else None
+                    self.host_ip = host.ip_address if host else "169.254.21.1"
+                    self.host_mac = bytes(host.mac_address) if host else b"\x00" * 6
+                    ours = next((p for p in parts if p is not host and self._pname(p) == self.nickname),
+                                None) or next((p for p in parts if p is not host
+                                               and getattr(p, "connected", False)), None)
+                    self.our_ip = (self._iface_ip() or (ours.ip_address if ours else None)
+                                   or self.host_ip.rsplit(".", 1)[0] + ".2")
+                    self.our_mac = ((bytes(ours.mac_address) if ours else None)
+                                    or self._iface_mac() or b"\x00" * 6)
+                    self.broadcast = self.our_ip.rsplit(".", 1)[0] + ".255"
+                    self.log(f"[live] joined ssid={self.ssid.hex()} "
+                             f"us={self.our_ip}/{self.our_mac.hex()} "
+                             f"host={self.host_ip}/{self.host_mac.hex()}")
+                    self.info("Joined.")
+                    self._ready.set()
+                    while not self._stop.is_set():
+                        await trio.sleep(0.2)
+            finally:
+                if helper is not None:
+                    await helper.aclose()
 
         try:
             trio.run(main)

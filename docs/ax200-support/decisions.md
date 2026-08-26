@@ -23,6 +23,16 @@ userspace :
 Cette voie évite un kernel custom et constitue le meilleur premier correctif si
 la capture est positive.
 
+### État de cette voie au 2026-08-27
+
+Les étapes 1 à 5 ont été réalisées sous la forme d’un helper monitor séparé et
+d’un IPC Unix strict. Le helper est lancé avant le scan et ses advertisements
+sont revalidées par le fork LDN. Il reçoit actuellement seulement des annonces
+pré-autorisation : elles ne contiennent pas la MAC du participant local et ne
+permettent donc pas de configurer l’adresse IP. La prochaine expérience reste
+dans cette branche : instrumenter précisément la phase de l’annonce et l’état
+du helper, sans assouplir les validations ni toucher au noyau.
+
 ### Résultat B — `mon0` ne voit plus les annonces
 
 Instrumenter `iwlmvm` avant de changer son comportement :

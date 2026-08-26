@@ -13,6 +13,28 @@ pkexec ./venv/bin/python tools/ax200_monitor_probe.py \
   --iface mon0 --keys /chemin/absolu/vers/prod.keys --duration 12
 ```
 
+## Helper monitor intégré
+
+`--monitor-iface mon0` lance automatiquement un helper séparé avant
+l’association. Le helper utilise une socket Unix privée et s’arrête avec la
+tentative de join ; il n’existe aucun fallback silencieux vers la réception
+station si le helper échoue. La VIF monitor doit déjà exister sur le même PHY.
+
+Pour le scénario actuel, lancer le join sous `pkexec` ; ne pas employer `sudo`
+dans les commandes de reprise :
+
+```bash
+pkexec env PYTHONPATH="$PWD" ./venv/bin/python frlgtrade.py \
+  --live --verbose --phy phy1 --monitor-iface mon0 \
+  -o output.pk3 PARTY1.pk3 PARTY2.pk3
+```
+
+Le helper doit être prêt avant le scan. Le timeout à 10 secondes avec le helper
+est un résultat de diagnostic, pas une preuve de succès : sur les essais du
+2026-08-27, les advertisements IPC étaient revalidées mais ne contenaient pas
+le participant local, sans adresse IP et sans erreur affichée par la Switch,
+qui restait en attente.
+
 ## Étape 0 — préparer une expérience contrôlée
 
 Consulter le [baseline reproductible](baseline.md), noter les révisions exactes
@@ -35,17 +57,17 @@ Commandes de départ à adapter au numéro de PHY réel :
 ```bash
 iw dev
 iw phy phy1 info | sed -n '/software interface modes/,/valid interface combinations/p'
-sudo systemctl stop NetworkManager
-sudo iw phy phy1 interface add mon0 type monitor
-sudo ip link set mon0 up
-sudo tcpdump -i mon0 -s 0 -U -w /tmp/ldn-ax200.pcap
+pkexec systemctl stop NetworkManager
+pkexec iw phy phy1 interface add mon0 type monitor
+pkexec ip link set mon0 up
+pkexec tcpdump -i mon0 -s 0 -U -w /tmp/ldn-ax200.pcap
 ```
 
 Dans un second terminal :
 
 ```bash
-sudo -E ./venv/bin/python frlgtrade.py \
-  --live --verbose --phy phy1 --preserve-iface mon0 \
+pkexec env PYTHONPATH="$PWD" ./venv/bin/python frlgtrade.py \
+  --live --verbose --phy phy1 --monitor-iface mon0 \
   -o output.pk3 PARTY1.pk3 PARTY2.pk3
 ```
 
@@ -53,16 +75,16 @@ sudo -E ./venv/bin/python frlgtrade.py \
 
 `frlgsim/transport.py:free_radio()` descend actuellement les interfaces
 non-LDN du PHY avant chaque tentative. Le bypass explicite
-`--preserve-iface mon0` préserve seulement l’interface indiquée ; il n’est pas
-actif par défaut et les VIF LDN restent toujours nettoyées. Ne pas modifier à
-la main le fichier installé dans `venv`.
+`--monitor-iface mon0` préserve l’interface indiquée et active le helper ; il
+n’est pas actif par défaut et les VIF LDN restent toujours nettoyées. Ne pas
+modifier à la main le fichier installé dans `venv`.
 
 Nettoyage après succès comme après exception :
 
 ```bash
-sudo ip link set mon0 down
-sudo iw dev mon0 del
-sudo systemctl start NetworkManager
+pkexec ip link set mon0 down
+pkexec iw dev mon0 del
+pkexec systemctl start NetworkManager
 ```
 
 Vérifier aussi la disparition de `ldnclient` et `ldn-mon`.

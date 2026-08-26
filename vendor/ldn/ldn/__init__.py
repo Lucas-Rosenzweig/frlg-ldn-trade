@@ -1038,7 +1038,7 @@ class NetworkInfo:
 class ConnectNetworkParam:
     ifname: str = "ldn"
     phyname: str = "phy0"
-    ifname_monitor: str | None = None
+    advertisement_source: typing.Any = None
 
     network: NetworkInfo = field(default_factory=lambda: NetworkInfo(1))
     password: bytes = b""
@@ -1233,7 +1233,7 @@ class Scanner:
 
 class STANetwork:
     _interface: wlan.Station
-    _monitor: wlan.ExistingMonitor | None
+    _advertisement_source: typing.Any
     _param: ConnectNetworkParam
     _key_derivation: KeyDerivation
 
@@ -1245,20 +1245,15 @@ class STANetwork:
 
     _network_id: int
     _participant_id: int
-    _monitor_frames: int
-    _monitor_actions: int
-    _monitor_vendor_actions: int
-    _monitor_vendor_other_source: int
-    _monitor_host_actions: int
-    _monitor_advertisements: int
-
+    _external_received: int
+    _external_accepted: int
     def __init__(self,
         interface: wlan.Station, param: ConnectNetworkParam,
         key_derivation: KeyDerivation,
-        monitor: wlan.ExistingMonitor | None = None,
+        advertisement_source: typing.Any = None,
     ):
         self._interface = interface
-        self._monitor = monitor
+        self._advertisement_source = advertisement_source
         self._param = param
         self._key_derivation = key_derivation
 
@@ -1270,12 +1265,8 @@ class STANetwork:
 
         self._network_id = 0
         self._participant_id = 0
-        self._monitor_frames = 0
-        self._monitor_actions = 0
-        self._monitor_vendor_actions = 0
-        self._monitor_vendor_other_source = 0
-        self._monitor_host_actions = 0
-        self._monitor_advertisements = 0
+        self._external_received = 0
+        self._external_accepted = 0
 
     def _check_authentication_response(
         self, address: MACAddress, data: bytes
@@ -1320,14 +1311,19 @@ class STANetwork:
 
     @contextlib.asynccontextmanager
     async def start(self) -> AsyncIterator[None]:
-        await self._authenticate()
-        async with util.background_task(self._process_events):
-            if self._monitor is None:
+        if self._advertisement_source is None:
+            await self._authenticate()
+            async with util.background_task(self._process_events):
                 await self._initialize_network()
                 async with util.background_task(self._monitor_network):
                     yield
-            else:
-                async with util.background_task(self._process_monitor):
+        else:
+            # The helper starts before the station association.  Consume its
+            # stream immediately so the queue can advance from pre-join
+            # advertisements to the host update that contains our participant.
+            async with util.background_task(self._process_advertisement_source):
+                await self._authenticate()
+                async with util.background_task(self._process_events):
                     await self._initialize_network()
                     async with util.background_task(self._monitor_network):
                         yield
@@ -1348,42 +1344,39 @@ class STANetwork:
                 disconnection = DisconnectEvent(DISCONNECT_CONNECTION_LOST)
                 await self._events.put(disconnection)
 
-    async def _process_monitor(self) -> None:
-        assert self._monitor is not None
+    async def _process_advertisement_source(self) -> None:
+        assert self._advertisement_source is not None
         while True:
-            radiotap = await self._monitor.recv()
-            self._monitor_frames += 1
-            if radiotap.frequency is None:
-                continue
-            action = wlan.ActionFrame()
-            try:
-                action.decode(radiotap.data)
-            except Exception:
-                continue
-            self._monitor_actions += 1
-            if action.action.startswith(b"\x7f\x00\x22\xaa\x04\x00\x01\x01"):
-                self._monitor_vendor_actions += 1
-                if action.source != self._network.address:
-                    self._monitor_vendor_other_source += 1
-            if action.source == self._network.address:
-                self._monitor_host_actions += 1
-            if await self._process_advertisement(action, radiotap.frequency):
-                self._monitor_advertisements += 1
+            source, frequency, action = \
+                await self._advertisement_source.receive_advertisement()
+            self._external_received += 1
+            accepted = await self._process_advertisement_data(
+                MACAddress(source), frequency, action
+            )
+            if accepted:
+                self._external_accepted += 1
 
     async def _process_advertisement(
         self, action: wlan.ActionFrame, frequency: int
     ) -> bool:
-        if action.source != self._network.address:
+        return await self._process_advertisement_data(
+            action.source, frequency, action.action
+        )
+
+    async def _process_advertisement_data(
+        self, source: MACAddress, frequency: int, action: bytes
+    ) -> bool:
+        if source != self._network.address:
             return False
 
         frame = AdvertisementFrame(self._key_derivation, self._network.protocol)
         try:
-            frame.decode(action.action)
+            frame.decode(action)
         except Exception:
             return False
 
         info = NetworkInfo(self._network.protocol)
-        info.address = action.source
+        info.address = source
         info.channel = wlan.map_frequency(frequency)
         info.band = ChannelBands[info.channel]
         info.parse_advertisement(frame)
@@ -1457,29 +1450,22 @@ class STANetwork:
     async def _initialize_network(self) -> None:
         await self._interface.set_authorized()
 
-        # A station registration normally reaches the nl80211 event path within
-        # one second.  A concurrent monitor receives the same broadcast at its
-        # own cadence, so give that optional source three beacon intervals.
         network = None
-        timeout = 3 if self._monitor is not None else 1
+        # The helper is bound before the scan, so its stream can contain a
+        # short pre-join backlog.  Allow the host enough advertisement cycles
+        # to publish the participant update after station authorization.
+        timeout = 10 if self._advertisement_source is not None else 1
         with trio.move_on_after(timeout):
             network, index = await self._wait_for_network()
 
         if network is None:
-            monitor_stats = ""
-            if self._monitor is not None:
-                monitor_stats = (
-                    "; monitor raw=%d action=%d vendor=%d vendor-other=%d "
-                    "host-action=%d decoded=%d" % (
-                        self._monitor_frames, self._monitor_actions,
-                        self._monitor_vendor_actions,
-                        self._monitor_vendor_other_source,
-                        self._monitor_host_actions, self._monitor_advertisements
-                    )
+            source_stats = ""
+            if self._advertisement_source is not None:
+                source_stats = "; external received=%d accepted=%d" % (
+                    self._external_received, self._external_accepted
                 )
             raise ConnectionError(
-                "Failed to obtain IP address after joining network (timeout)" +
-                monitor_stats
+                "Failed to obtain IP address after joining network (timeout)" + source_stats
             )
 
         # Initialize local state
@@ -2002,21 +1988,15 @@ async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
         )
 
     async with wlan.create_factory() as factory:
-        monitor = None
-        if param.ifname_monitor is not None:
-            monitor = wlan.ExistingMonitor(param.ifname_monitor)
-            await monitor.activate()
-        try:
-            async with factory.connect_network(
-                param.phyname, param.ifname, network.ssid.hex(), network.channel,
-                wlan_key
-            ) as interface:
-                sta = STANetwork(interface, param, key_derivation, monitor)
-                async with sta.start():
-                    yield sta
-        finally:
-            if monitor is not None:
-                monitor.close()
+        async with factory.connect_network(
+            param.phyname, param.ifname, network.ssid.hex(), network.channel,
+            wlan_key
+        ) as interface:
+            sta = STANetwork(
+                interface, param, key_derivation, param.advertisement_source
+            )
+            async with sta.start():
+                yield sta
 
 
 @contextlib.asynccontextmanager

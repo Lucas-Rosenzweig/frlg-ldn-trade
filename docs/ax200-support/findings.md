@@ -55,14 +55,18 @@ deux faits ne prouvent pas encore à quel étage les trames sont perdues.
   une fenêtre de 15 s pendant les mêmes trois timeouts post-association. Le
   contournement monitor peut donc réutiliser le décodeur LDN ; ce résultat ne
   dépend pas de `tcpdump`.
-- Le fork local `vendor/ldn` ajoute `ConnectNetworkParam.ifname_monitor` : il
-  alimente la file d’advertisements de la station depuis une VIF monitor déjà
-  existante, sans créer ni supprimer cette VIF. Le join minimal AX200 a atteint
-  l’initialisation réseau au moins une fois avec ce chemin ; le trade complet
-  n’a pas encore été exécuté.
+- Le fork local `vendor/ldn` accepte désormais une source externe
+  d’advertisements. Avec `--monitor-iface`, l’application lance un helper
+  séparé lié à la VIF existante ; LDN revalide ensuite chaque advertisement
+  reçue par IPC. Le helper ne crée, ne retune ni ne supprime cette VIF.
 - Les essais avec le fork monitor restent intermittents : après liaison
   pré-association, le RX monitor a été observé mais aucune advertisement n’a
   été décodée dans une fenêtre ; les échecs persistent.
+- Le helper IPC séparé démarre, remet des advertisements au fork et ceux-ci
+  passent la revalidation d’identité. Sur les essais actuels, seules les
+  advertisements pré-autorisation sont reçues : aucune ne contient le
+  participant local, même après une attente de 10 s. Le correctif n’est donc
+  pas encore validé sur AX200.
 
 ### Machine de reproduction communiquée le 2026-08-26
 

@@ -1,8 +1,9 @@
 # Portage Intel AX200 — dossier de reprise agentique
 
-- Dernière mise à jour : 2026-08-26
-- État : contournement userspace monitor obtient l’initialisation réseau AX200 ;
-  validation d’un trade complet et non-régression encore requises
+- Dernière mise à jour : 2026-08-27
+- État : le helper monitor IPC reçoit et fait revalider des advertisements ; le
+  join AX200 n’obtient toutefois pas encore d’adresse IP et la Switch reste en
+  attente. Aucun trade ni contrôle de non-régression n’est validé.
 - Dépôt de départ : `tornadus/frlg-ldn-trade`, commit `799b674`
 
 Ce dossier est l’entrée unique de l’enquête AX200. Les faits, la procédure, les
@@ -51,14 +52,17 @@ Action Frames enregistrées avec `NL80211_CMD_REGISTER_FRAME`.
 
 Le test station + monitor du 2026-08-26 a toutefois reçu 53 Action Frames
 vendor-specific sur `mon0` pendant 8,7 secondes, puis le probe LDN a décodé 41
-advertisements en 15 secondes. Le fork monitor a atteint l’initialisation
-réseau au moins une fois, mais aucun trade complet n’est encore validé et le
-comportement reste intermittent.
+advertisements en 15 secondes. Le helper séparé, lancé avant le scan, a remis
+10–11 advertisements par tentative au fork LDN, toutes revalidées. Aucune ne
+contenait toutefois le participant local, y compris après 10 secondes :
+l’initialisation réseau ne démarre donc pas.
 
-**Prochaine action prioritaire :** exécuter un échange réel avec le fork monitor,
-puis répéter le scénario sur une carte connue fonctionnelle sans
-`--monitor-iface`. Ne modifier ni le noyau ni son annonce de capability avant
-ces validations.
+**Prochaine action prioritaire :** instrumenter le helper et la phase LDN pour
+déterminer pourquoi les advertisements post-autorisation cessent d’être reçues
+ou ne contiennent pas le participant local. N’exécuter un trade réel et le
+contrôle sur une carte connue fonctionnelle qu’après l’obtention répétée de
+l’adresse IP. Ne modifier ni le noyau ni son annonce de capability avant ces
+validations.
 
 Le probe versionné et le protocole exact sont décrits dans la
 [procédure hardware](procedure.md). Les révisions et précautions de baseline

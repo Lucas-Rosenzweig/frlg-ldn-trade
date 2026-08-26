@@ -1201,37 +1201,6 @@ class Monitor(Interface):
             return None
 
 
-class ExistingMonitor:
-    """Receive radiotap frames from a monitor interface owned by the caller.
-
-    Unlike :class:`Monitor`, this class never creates, retunes or deletes a
-    virtual interface.  It exists for a station+monitor setup where a driver
-    delivers broadcast Action Frames only to the monitor RX path.
-    """
-
-    def __init__(self, ifname: str):
-        self._name = ifname
-        self._socket = trio.socket.socket(
-            socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
-        )
-
-    async def activate(self) -> None:
-        await self._socket.bind((self._name, 0))
-
-    async def recv(self) -> RadiotapFrame:
-        while True:
-            data = await self._socket.recv(4096)
-            radiotap = RadiotapFrame()
-            try:
-                radiotap.decode(data)
-                return radiotap
-            except Exception:
-                logger.debug("Ignoring invalid radiotap frame")
-
-    def close(self) -> None:
-        self._socket.close()
-
-
 class Station(Interface):
     """Represents an interface in station mode."""
 
