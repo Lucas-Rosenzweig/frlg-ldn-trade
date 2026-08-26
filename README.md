@@ -41,6 +41,9 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 | Intel AX200        | Internal (M.2) | iwlwifi | Unable to be assigned ip |
 | Atheros AR9271 | External       | ath9k_htc | Unable to be assigned ip (most of the time) |
 
+See the [Intel AX200 support dossier](docs/ax200-support/index.md) for the
+current diagnosis, experiments, and live-acceptance criteria.
+
 ## Usage
 ```sudo -E ./venv/bin/python frlgtrade.py --live -o output.pk3 PARTY1.pk3 PARTY2.pk3```
 
