@@ -6,6 +6,12 @@
 /*/
 !/frlgsim/
 !/docs/
+!/tools/
+!/tools/ax200_monitor_probe.py
+!/vendor/
+!/vendor/ldn/
+!/vendor/ldn/**
+vendor/ldn/ldn.egg-info/
 
 # Never publish Pokemon data files (live-trade outputs can carry trainer/account
 # identifiers); covers any stray .pk3/.ek3 at the root or inside frlgsim/ too.

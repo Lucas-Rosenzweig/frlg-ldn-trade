@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: ldn
+Version: 0.0.17
+Summary: Python package for local wireless communication with a Nintendo Switch.
+Home-page: https://github.com/kinnay/LDN
+Author: Yannik Marchand
+Author-email: ymarchand@me.com
+License: GPLv3
+Platform: Linux
+License-File: LICENSE
+Requires-Dist: python-netlink==0.0.15
+Requires-Dist: pycryptodome
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: platform
+Dynamic: requires-dist
+Dynamic: summary
+
+This package implements LDN, or local wireless communication with a Nintendo Switch. Because LDN operates at the data link layer it requires low-level access to your network hardware. This package only supports Linux systems.

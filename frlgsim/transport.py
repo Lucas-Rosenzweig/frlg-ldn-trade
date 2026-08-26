@@ -146,15 +146,21 @@ def list_phy_ifaces():
     return mapping
 
 
-def free_radio(phys, log=print):
-    """Delete leftover LDN vifs and take any other interface off the radio so the station can
-    grab the channel (fixes SET_CHANNEL -> EBUSY). Brings your normal Wi-Fi down on that adapter
-    for the duration (restore with wifi-init.sh --restore). Needs root."""
+def free_radio(phys, log=print, preserve_ifaces=()):
+    """Delete leftover LDN vifs and take other interfaces off the radio before a join.
+
+    ``preserve_ifaces`` is an explicit diagnostic escape hatch for a concurrent
+    monitor VIF (for example ``mon0``).  It never preserves an LDN-owned VIF,
+    so stale ``ldnclient`` interfaces are still removed between attempts.
+    """
+    preserve_ifaces = set(preserve_ifaces) - LDN_VIFS
     mapping = list_phy_ifaces()
     for phy in {p for p in phys if p}:
         for iface in mapping.get(phy, []):
             if iface in LDN_VIFS:
                 _iw_del(iface)
+            elif iface in preserve_ifaces:
+                log(f"[live] diagnostic: preserving {iface} ({phy})")
             else:
                 _run(["nmcli", "device", "set", iface, "managed", "no"])
                 _run(["ip", "link", "set", iface, "down"])
@@ -287,13 +293,16 @@ class LiveTransport:
 
     def __init__(self, password=None, nickname="EMU", keys_path="~/.switch/prod.keys",
                  local_comm_id=None, scene_id=None, app_version=None,
-                 phyname="phy0", ifname="ldnclient", log=print):
+                 phyname="phy0", ifname="ldnclient", log=print, preserve_ifaces=(),
+                 monitor_ifname=None):
         self.info = getattr(log, "info", log)   # clean milestone sink (default-mode narration)
         self.password = password if password else GBA_APP_PASSPHRASE
         self.nickname = nickname
         self.keys_path = keys_path
         self.phyname = phyname
         self.ifname = ifname
+        self.preserve_ifaces = tuple(preserve_ifaces)
+        self.monitor_ifname = monitor_ifname
         if local_comm_id is not None:
             self.LOCAL_COMMUNICATION_ID = local_comm_id
         if scene_id is not None:
@@ -327,7 +336,10 @@ class LiveTransport:
         hidden behind trio's opaque ExceptionGroup."""
         last_err = None
         for attempt in range(1, attempts + 1):
-            free_radio({self.phyname}, self.log)        # clear the radio before each join attempt
+            preserve_ifaces = self.preserve_ifaces
+            if self.monitor_ifname is not None:
+                preserve_ifaces += (self.monitor_ifname,)
+            free_radio({self.phyname}, self.log, preserve_ifaces)
             self._err = None
             self._ready.clear()
             self._stop.clear()
@@ -403,6 +415,7 @@ class LiveTransport:
             param.app_version = self.APPLICATION_VERSION
             param.phyname = self.phyname              # wifi phy (like the bridge: phy0)
             param.ifname = self.ifname                # station iface (like the bridge: ldnclient)
+            param.ifname_monitor = self.monitor_ifname
             self.info("Joining the host...")
             async with ldn.connect(param) as network:
                 info = network.info()

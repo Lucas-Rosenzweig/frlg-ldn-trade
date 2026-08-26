@@ -108,7 +108,9 @@ def run_live(args, lg):
     comm_id = int(args.comm_id, 16) if args.comm_id else None
     password = bytes.fromhex(args.password) if args.password else None   # None -> built-in
     t = tmod.LiveTransport(password=password, nickname=args.ot, keys_path=args.keys,
-                           local_comm_id=comm_id, phyname=args.phy, log=lg).start()
+                           local_comm_id=comm_id, phyname=args.phy,
+                           preserve_ifaces=args.preserve_iface,
+                           monitor_ifname=args.monitor_iface, log=lg).start()
     pc = cryptomod.PiaCrypto(t.ssid)
     engine = make_engine(args, lg)
     # Pia CONNECTION layer (S0): Net 0x11->0x12, Session(13) join, RTT keepalive. WITHOUT this the
@@ -378,6 +380,12 @@ def main():
     ap.add_argument("--password", default="", help="LDN passphrase as hex (live); default = "
                     "the built-in 64-byte emulator passphrase (shared by FRLG/RSE)")
     ap.add_argument("--phy", default="phy0", help="wifi phy for the LDN join (live)")
+    ap.add_argument("--preserve-iface", action="append", default=[], metavar="IFACE",
+                    help="(live diagnostic) leave this interface up while freeing --phy; "
+                    "use mon0 for the AX200 station+monitor capture")
+    ap.add_argument("--monitor-iface", metavar="IFACE",
+                    help="(live AX200 experiment) receive post-join LDN advertisements from "
+                    "an existing monitor VIF; it is preserved automatically")
     ap.add_argument("--keys", default="~/.switch/prod.keys", help="Switch prod.keys (live)")
     ap.add_argument("--comm-id", help="LDN local_communication_id (hex) to join (live); "
                     "if omitted, joins the only available network (scan logs candidates)")
