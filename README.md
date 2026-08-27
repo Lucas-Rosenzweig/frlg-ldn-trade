@@ -29,23 +29,62 @@ This demo was recorded using the **ALFA AWUS036ACHM**. The RZ616 is half as fast
 ### Tested WiFi Cards
 
 | Model            | Type           | Driver  | Reliability  |
-|------------------|----------------|---------|---------------
+|------------------|----------------|---------|--------------|
 | AMD RZ616        | Internal (M.2) | mt7921e | Low          |
 | ALFA AWUS036ACHM | External       | mt76x0u | High         |
 | Realtek RTL8821CE | Internal (PCIe 1x) | rtw88_8821ce | High |
+| Intel AX200 | Internal (M.2) | iwlwifi/iwlmvm | Experimental: one complete trade with monitor workaround |
 
 ### Known Problematic WiFi Cards
 
 | Model            | Type           | Driver  | Issue        |
-|------------------|----------------|---------|---------------
-| Intel AX200        | Internal (M.2) | iwlwifi | Unable to be assigned ip |
+|------------------|----------------|---------|--------------|
 | Atheros AR9271 | External       | ath9k_htc | Unable to be assigned ip (most of the time) |
 
 See the [Intel AX200 support dossier](docs/ax200-support/index.md) for the
 current diagnosis, experiments, and live-acceptance criteria.
 
+### Experimental Intel AX200 path
+
+On 2026-08-27 an AX200 completed one real end-to-end trade, including a valid
+100-byte output `.pk3` and a clean RFU disconnect. This is not yet considered a
+fully validated fix: two more AX200 repetitions and a regression check with a
+known-good adapter are still required. The station still misses the
+post-authorization LDN advertisement, so the workaround uses a tightly guarded
+`.2` address inference after a timeout.
+
+The AX200 path needs an existing monitor interface and the explicit
+`--monitor-iface` flag. It also performs a managed pre-connect scan to populate
+the AX200 BSS cache. These behaviors are not enabled for the normal adapter
+path.
+
+```bash
+pkexec systemctl stop NetworkManager
+pkexec iw phy phy0 interface add mon0 type monitor
+pkexec ip link set mon0 up
+
+pkexec env PYTHONUNBUFFERED=1 PYTHONPATH="$PWD" \
+  "$PWD/venv/bin/python" "$PWD/frlgtrade.py" \
+  --live --verbose --phy phy0 --monitor-iface mon0 \
+  --keys /absolute/path/to/prod.keys \
+  -o "$PWD/output.pk3" "$PWD/PARTY1.pk3" "$PWD/PARTY2.pk3"
+```
+
+Before every retry, ensure that no privileged client from an earlier `pkexec`
+run is still alive. An interrupted parent shell may leave its root child
+running; multiple clients can poison the current Switch lobby. Kill stale
+clients, delete `ldnclient`, and recreate the Leader lobby before retrying.
+The exact checks, milestones and rollback commands are in the
+[AX200 hardware procedure](docs/ax200-support/procedure.md); the first success
+is documented in [its full report](docs/ax200-support/first-success.md).
+
 ## Usage
-```sudo -E ./venv/bin/python frlgtrade.py --live -o output.pk3 PARTY1.pk3 PARTY2.pk3```
+
+```bash
+pkexec env PYTHONPATH="$PWD" \
+  "$PWD/venv/bin/python" "$PWD/frlgtrade.py" \
+  --live -o "$PWD/output.pk3" "$PWD/PARTY1.pk3" "$PWD/PARTY2.pk3"
+```
 
 **Optional Flags (not comprehensive):**
 
@@ -54,6 +93,7 @@ current diagnosis, experiments, and live-acceptance criteria.
 | --verbose    | N/A              | Verbose output  |
 | --phy        | phy# (e.g. phy1)  | WiFi phy selection |
 | --keys       | /path/to/prod.keys | non-default prod.keys location |
+| --monitor-iface | interface (e.g. mon0) | explicit experimental monitor helper, required for current AX200 workaround |
 
 Above is the configuration I suggest using if you'd like a quick and easy demonstration of the program. You can use any of the listed optional flags, they're safe. Many of the undocumented ones are either unfinished, untested, internal tools, or artifacts of experiments that did not/have not yet panned out.
 
@@ -65,13 +105,18 @@ Above is the configuration I suggest using if you'd like a quick and easy demons
 **Step-by-step Usage**
 1. Select trading at the direct corner and make your console the "Leader".
 2. Run the script. It may take multiple times to successfully connect.
-3. Approve the join request from "EMU".
+3. Wait for "EMU" to join and for both players to enter the trading room.
 4. Walk to the LEFT CHAIR in the trading room. Walking may be laggy.
 5. Select the Pokémon you'd like to trade away.
 6. Accept the trade confirmation. You will be traded the *2nd* simulated party member.
 7. Once you return to the trade menu, cancel the trade.
 8. Walk out.
 9. You'll find PARTY2.pk3 in your party, and the Pokémon you traded will be in pwd as output.pk3 (or whatever you called it). 
+
+After the run, restore your network manager and remove temporary LDN/monitor
+interfaces. AX200 users should follow the exact cleanup in the
+[hardware procedure](docs/ax200-support/procedure.md), including checking for
+privileged child processes left behind by an interrupted `pkexec` command.
  
 ## Credits
 - [kinnay](https://github.com/kinnay) - For the [LDN library](https://github.com/kinnay/LDN) this is built upon, and the excellent [NintendoClients Wiki](https://github.com/kinnay/NintendoClients/wiki)

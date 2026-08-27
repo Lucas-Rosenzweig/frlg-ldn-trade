@@ -23,15 +23,41 @@ userspace :
 Cette voie évite un kernel custom et constitue le meilleur premier correctif si
 la capture est positive.
 
-### État de cette voie au 2026-08-27
+### État de cette voie après le premier succès du 2026-08-27
 
 Les étapes 1 à 5 ont été réalisées sous la forme d’un helper monitor séparé et
 d’un IPC Unix strict. Le helper est lancé avant le scan et ses advertisements
-sont revalidées par le fork LDN. Il reçoit actuellement seulement des annonces
-pré-autorisation : elles ne contiennent pas la MAC du participant local et ne
-permettent donc pas de configurer l’adresse IP. La prochaine expérience reste
-dans cette branche : instrumenter précisément la phase de l’annonce et l’état
-du helper, sans assouplir les validations ni toucher au noyau.
+sont revalidées par le fork LDN. Le chemin AX200 ajoute deux mesures explicites
+et limitées à `--monitor-iface` : un scan géré préalable au CONNECT, puis une
+inférence de `169.254.X.2` si l’annonce post-autorisation manque et si toutes
+les préconditions structurelles sont satisfaites.
+
+Ce chemin a terminé un échange réel, mais ne corrige pas la disparition de
+l’annonce post-autorisation. La prochaine décision n’est plus « réécrire le
+driver ou non » : elle consiste d’abord à répéter deux fois le succès et à
+exécuter le contrôle sur un adaptateur connu. Un échec de répétition doit être
+classé avec les jalons et compteurs existants avant toute nouvelle surface de
+modification.
+
+### Branche opérationnelle de répétition
+
+```text
+anciens processus live présents ?
+  oui -> les tuer comme root, supprimer ldnclient, recréer le salon
+  non
+    -> helper voit une annonce sur 1/6/11 ?
+       non -> vérifier que le salon émet ; résultat non interprétable pour l'IP
+       oui
+         -> CONNECT produit un événement après le scan géré ?
+            non -> échec association/cache BSS
+            oui
+              -> annonce avec participant local avant 10 s ?
+                 oui -> adresse issue du protocole, chemin préféré
+                 non -> inférence seulement si garde stricte satisfaite
+                   -> type 5 Session + RTT/Reliable ?
+                      non -> vérifier unicité du client et salon neuf
+                      oui -> poursuivre RFU jusqu'au commit et à la fermeture D
+```
 
 ### Résultat B — `mon0` ne voit plus les annonces
 
@@ -78,6 +104,8 @@ exposer la frame.
 | Fork/intégration Python | dépendance reproductible, détection, logs | facile | toujours |
 | Probe station + monitor | localiser la perte | raisonnable | prochaine étape |
 | Contournement monitor dans LDN | recevoir les annonces hors station | moyenne | résultat A |
+| Scan géré préalable | peupler le cache BSS AX200 avant CONNECT | faible | option monitor explicite |
+| Inférence IP gardée | poursuivre malgré l’annonce post-auth manquante | moyenne | hôte `.1`, 1 participant, capacité ≥ 2, timeout |
 | Instrumentation `iwlmvm` | voir les Action Frames RX | raisonnable | résultat B ou ambigu |
 | Patch fonctionnel `iwlmvm` | remonter le multicast correctement | difficile | support démontré |
 | Firmware Intel | changer le filtrage embarqué | très difficile | perte prouvée firmware |

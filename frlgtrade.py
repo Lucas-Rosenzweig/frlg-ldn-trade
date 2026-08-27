@@ -121,10 +121,15 @@ def run_live(args, lg):
         lg(f"[live] WARNING: MAC(s) not resolved from the participant list "
               f"(us={t.our_mac and t.our_mac.hex()} host={t.host_mac and t.host_mac.hex()}); "
               f"the Session join may be rejected.")
+    # Pia 6.x variable ids are per-session random values (and must be >= 2),
+    # rather than the fixed value preserved for deterministic replay defaults.
+    our_var = int.from_bytes(os.urandom(2), "big")
+    if our_var < 2:
+        our_var += 2
     conn = pia_connect.ConnectionManager(
         our_mac=t.our_mac or b"\x00" * 6, host_mac=t.host_mac or b"\x00" * 6,
         our_ip=t.our_ip, host_ip=t.host_ip, player_name=args.ot,
-        random4=os.urandom(4), log=lg)
+        random4=os.urandom(4), our_var=our_var, log=lg)
     # Held-keys overworld link-state engine: keepalive (0xBE00 EMPTY) every idle VBlank, sit at
     # the RIGHT seat (mpId 1), then cancel-to-leave after the configured trade(s). self_id is
     # asserted == 1 (the joiner / RIGHT seat) [frlgsim/linkstate.py; trade.c:1816].
@@ -140,7 +145,8 @@ def run_live(args, lg):
     lg(f"[live] emulator connect: will send 'C' with connect id {connect_id.hex()} "
           f"({'override' if args.connect_id else 'random nonzero'}); the host's 'A' (0x41) accept "
           f"seats our slot - the value need not match anything on the host.")
-    s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, compress=args.compress,
+    s = simmod.Sim(t, pc, engine, t.our_ip, t.host_ip, conn=conn, our_var=our_var,
+                   compress=args.compress,
                    linkstate=lstate, connect_id=connect_id, capture_path=args.capture, log=lg)
     if args.capture:
         lg(f"[live] capturing every Pia datagram (both dirs) -> {args.capture} "

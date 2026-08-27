@@ -15,6 +15,7 @@ LiveTransport   - LIVE. Joins the FRLG console's LDN session with kinnay's `ldn`
 import base64
 import json
 import os
+import pwd
 import shutil
 import socket
 import struct
@@ -117,6 +118,23 @@ def _format_join_error(e):
         body = "".join(traceback.format_exception(type(leaf), leaf, leaf.__traceback__))
         parts.append(f"  [{i}] {type(leaf).__name__}: {leaf}\n{body}")
     return "\n".join(parts)
+
+
+def _resolve_keys_path(path, environ=None, euid=None):
+    """Resolve the caller's default keys path when Polkit has switched to root.
+
+    ``pkexec`` exposes the original uid as ``PKEXEC_UID`` but changes ``HOME``
+    to ``/root``.  Keep explicit absolute paths untouched and only use that uid
+    for the documented ``~/.switch/prod.keys`` default.
+    """
+    environ = os.environ if environ is None else environ
+    euid = os.geteuid() if euid is None else euid
+    if path.startswith("~/") and euid == 0 and environ.get("PKEXEC_UID"):
+        try:
+            return os.path.join(pwd.getpwuid(int(environ["PKEXEC_UID"])).pw_dir, path[2:])
+        except (KeyError, ValueError):
+            pass
+    return os.path.expanduser(path)
 
 # LDN virtual interfaces to clear off the radio (ported from the bridge tooling).
 LDN_VIFS = {"ldn", "ldn-mon", "ldn-tap", "ldnclient"}
@@ -299,6 +317,7 @@ class _MonitorAdvertisementSource:
         self._stream = stream
         self._buffer = bytearray()
         self.received = 0
+        self.stats = None
 
     async def _message(self):
         while b"\n" not in self._buffer:
@@ -326,8 +345,13 @@ class _MonitorAdvertisementSource:
             raise MonitorHelperError("monitor helper did not send ready")
 
     async def receive_advertisement(self):
-        message = await self._message()
-        if message.get("type") != "advertisement":
+        while True:
+            message = await self._message()
+            if message.get("type") == "stats":
+                self._set_stats(message)
+                continue
+            if message.get("type") == "advertisement":
+                break
             raise MonitorHelperError("monitor helper sent an unexpected message")
         source = message.get("source")
         frequency = message.get("frequency")
@@ -348,6 +372,21 @@ class _MonitorAdvertisementSource:
         self.received += 1
         return source_bytes, frequency, action_bytes
 
+    def _set_stats(self, message):
+        phase = message.get("phase")
+        fields = ("raw", "radiotap", "action", "vendor", "advertisement")
+        if phase not in {"pre-join", "authorized"}:
+            raise MonitorHelperError("monitor helper sent an invalid stats phase")
+        stats = {field: message.get(field) for field in fields}
+        if any(not isinstance(value, int) or value < 0 for value in stats.values()):
+            raise MonitorHelperError("monitor helper sent invalid stats")
+        self.stats = {"phase": phase, **stats}
+
+    async def mark_authorized(self):
+        await self._stream.send_all(
+            b'{"version":1,"type":"mark","phase":"authorized"}\n'
+        )
+
     async def aclose(self):
         await self._stream.aclose()
 
@@ -357,7 +396,7 @@ class _MonitorHelper:
 
     def __init__(self, ifname, keys_path):
         self.ifname = ifname
-        self.keys_path = keys_path
+        self.keys_path = _resolve_keys_path(keys_path)
         self.runtime_dir = None
         self.listener = None
         self.process = None
@@ -427,6 +466,55 @@ class _MonitorHelper:
             self.runtime_dir = None
 
 
+async def _scan_from_monitor_source(
+    ldn, keys, source, ifname, channels=(1, 6, 11), dwell_time=1.0
+):
+    """Decode scan candidates from the already-running AX200 monitor helper.
+
+    Creating LDN's normal scan monitor beside ``mon0`` changes the receive set
+    on this adapter.  Reuse the IPC stream instead, then leave the same source
+    attached to ``STANetwork`` for the post-association advertisement.  Unlike
+    a normal ``ldn.scan()``, an existing monitor VIF does not hop channels by
+    itself, so explicitly sweep the standard LDN channels before connecting.
+    """
+    import trio
+    from ldn import wlan
+
+    derivations = {
+        protocol: ldn.KeyDerivation(keys, protocol) for protocol in (1, 3)
+    }
+    networks = []
+    addresses = set()
+    for channel in channels:
+        result = await trio.run_process(
+            ["/usr/sbin/iw", "dev", ifname, "set", "channel", str(channel)],
+            capture_stdout=True, capture_stderr=True, check=False,
+        )
+        if result.returncode:
+            raise MonitorHelperError(
+                f"could not tune monitor interface {ifname} to channel {channel}"
+            )
+        with trio.move_on_after(dwell_time):
+            while True:
+                source_address, frequency, action = await source.receive_advertisement()
+                for protocol, derivation in derivations.items():
+                    frame = ldn.AdvertisementFrame(derivation, protocol)
+                    try:
+                        frame.decode(action)
+                    except Exception:
+                        continue
+                    info = ldn.NetworkInfo(protocol)
+                    info.address = ldn.MACAddress(source_address)
+                    info.channel = wlan.map_frequency(frequency)
+                    info.band = ldn.ChannelBands[info.channel]
+                    info.parse_advertisement(frame)
+                    if info.address not in addresses:
+                        addresses.add(info.address)
+                        networks.append(info)
+                    break
+    return networks
+
+
 # ---------------------------------------------------------------------------
 class LiveTransport:
     """Join the console's LDN session and exchange UDP :12345 datagrams. Mirrors the bridge
@@ -440,15 +528,18 @@ class LiveTransport:
     def __init__(self, password=None, nickname="EMU", keys_path="~/.switch/prod.keys",
                  local_comm_id=None, scene_id=None, app_version=None,
                  phyname="phy0", ifname="ldnclient", log=print, preserve_ifaces=(),
-                 monitor_ifname=None):
+                 monitor_ifname=None, preconnect_scan=None):
         self.info = getattr(log, "info", log)   # clean milestone sink (default-mode narration)
         self.password = password if password else GBA_APP_PASSPHRASE
         self.nickname = nickname
-        self.keys_path = keys_path
+        self.keys_path = _resolve_keys_path(keys_path)
         self.phyname = phyname
         self.ifname = ifname
         self.preserve_ifaces = tuple(preserve_ifaces)
         self.monitor_ifname = monitor_ifname
+        self.preconnect_scan = (
+            monitor_ifname is not None if preconnect_scan is None else preconnect_scan
+        )
         if local_comm_id is not None:
             self.LOCAL_COMMUNICATION_ID = local_comm_id
         if scene_id is not None:
@@ -473,13 +564,15 @@ class LiveTransport:
         self._err = None
 
     # -- LDN join runs in a trio thread that keeps the connection alive -------
-    def start(self, timeout=30, attempts=3, settle=1.5):
+    def start(self, timeout=None, attempts=3, settle=1.5):
         """Join the LDN network, retrying transient failures. The LDN/nl80211 layer flakes
         intermittently (radio busy, association timeout, a stale vif racing the fresh join) - the
         SAME failure the bridge hits as 'connection failed'. Rather than make the user re-run, we
         free the radio and retry up to `attempts` times, logging each attempt's FULLY-UNWRAPPED
         cause (see _format_join_error) so persistent problems are still diagnosable instead of
         hidden behind trio's opaque ExceptionGroup."""
+        if timeout is None:
+            timeout = 60 if self.monitor_ifname is not None else 30
         last_err = None
         for attempt in range(1, attempts + 1):
             preserve_ifaces = self.preserve_ifaces
@@ -533,13 +626,13 @@ class LiveTransport:
                     await helper.aclose()
                     raise
             self.info("Scanning for the FRLG network...")
-            # The AX200 monitor path can see advertisements less frequently than
-            # LDN's 110 ms default dwell.  Keep the established fast scan for
-            # normal adapters, but give each channel a full second when the
-            # monitor helper is explicitly requested.
-            dwell_time = 1.0 if self.monitor_ifname is not None else .110
             try:
-                networks = await ldn.scan(keys, phyname=self.phyname, dwell_time=dwell_time)
+                if helper is not None:
+                    networks = await _scan_from_monitor_source(
+                        ldn, keys, helper.source, self.monitor_ifname
+                    )
+                else:
+                    networks = await ldn.scan(keys, phyname=self.phyname)
             except BaseException:
                 if helper is not None:
                     await helper.aclose()
@@ -581,6 +674,9 @@ class LiveTransport:
             param.app_version = self.APPLICATION_VERSION
             param.phyname = self.phyname              # wifi phy (like the bridge: phy0)
             param.ifname = self.ifname                # station iface (like the bridge: ldnclient)
+            param.diagnostic = lambda stage: self.log(f"[live] ldn stage={stage}")
+            param.preconnect_scan = self.preconnect_scan
+            param.infer_address_on_timeout = self.monitor_ifname is not None
             try:
                 if self.monitor_ifname is not None:
                     param.advertisement_source = helper.source
@@ -613,8 +709,20 @@ class LiveTransport:
                 if helper is not None:
                     await helper.aclose()
 
+        async def main_with_stop():
+            async def stop_watcher(cancel_scope):
+                while not self._stop.is_set():
+                    await trio.sleep(.1)
+                self._err = "LDN join cancelled after caller timeout"
+                cancel_scope.cancel()
+
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(stop_watcher, nursery.cancel_scope)
+                await main()
+                nursery.cancel_scope.cancel()
+
         try:
-            trio.run(main)
+            trio.run(main_with_stop)
         except BaseException as e:                     # pragma: no cover
             # trio wraps nursery failures in a (Base)ExceptionGroup whose str() is the useless
             # "Exceptions from Trio nursery (N sub-exceptions)"; unwrap to the real leaf cause(s).

@@ -1039,6 +1039,9 @@ class ConnectNetworkParam:
     ifname: str = "ldn"
     phyname: str = "phy0"
     advertisement_source: typing.Any = None
+    diagnostic: typing.Callable[[str], None] | None = None
+    preconnect_scan: bool = False
+    infer_address_on_timeout: bool = False
 
     network: NetworkInfo = field(default_factory=lambda: NetworkInfo(1))
     password: bytes = b""
@@ -1247,6 +1250,10 @@ class STANetwork:
     _participant_id: int
     _external_received: int
     _external_accepted: int
+    _external_after_authorization: int
+    _external_accepted_after_authorization: int
+    _external_with_local_participant: int
+    _authorized: bool
     def __init__(self,
         interface: wlan.Station, param: ConnectNetworkParam,
         key_derivation: KeyDerivation,
@@ -1267,6 +1274,10 @@ class STANetwork:
         self._participant_id = 0
         self._external_received = 0
         self._external_accepted = 0
+        self._external_after_authorization = 0
+        self._external_accepted_after_authorization = 0
+        self._external_with_local_participant = 0
+        self._authorized = False
 
     def _check_authentication_response(
         self, address: MACAddress, data: bytes
@@ -1300,6 +1311,10 @@ class STANetwork:
     def info(self) -> NetworkInfo:
         return self._network
 
+    def _diagnostic(self, stage: str) -> None:
+        if self._param.diagnostic is not None:
+            self._param.diagnostic(stage)
+
     def participant(self) -> ParticipantInfo:
         return self._network.participants[self._participant_id]
 
@@ -1322,7 +1337,10 @@ class STANetwork:
             # stream immediately so the queue can advance from pre-join
             # advertisements to the host update that contains our participant.
             async with util.background_task(self._process_advertisement_source):
+                self._diagnostic("advertisement-source-ready")
+                self._diagnostic("authentication-start")
                 await self._authenticate()
+                self._diagnostic("authentication-complete")
                 async with util.background_task(self._process_events):
                     await self._initialize_network()
                     async with util.background_task(self._monitor_network):
@@ -1350,11 +1368,15 @@ class STANetwork:
             source, frequency, action = \
                 await self._advertisement_source.receive_advertisement()
             self._external_received += 1
+            if self._authorized:
+                self._external_after_authorization += 1
             accepted = await self._process_advertisement_data(
-                MACAddress(source), frequency, action
+                MACAddress(source), frequency, action, external=True
             )
             if accepted:
                 self._external_accepted += 1
+                if self._authorized:
+                    self._external_accepted_after_authorization += 1
 
     async def _process_advertisement(
         self, action: wlan.ActionFrame, frequency: int
@@ -1364,7 +1386,8 @@ class STANetwork:
         )
 
     async def _process_advertisement_data(
-        self, source: MACAddress, frequency: int, action: bytes
+        self, source: MACAddress, frequency: int, action: bytes,
+        external: bool = False,
     ) -> bool:
         if source != self._network.address:
             return False
@@ -1380,6 +1403,12 @@ class STANetwork:
         info.channel = wlan.map_frequency(frequency)
         info.band = ChannelBands[info.channel]
         info.parse_advertisement(frame)
+
+        if external and self._authorized and any(
+            participant.mac_address == self._interface.address()
+            for participant in info.participants
+        ):
+            self._external_with_local_participant += 1
 
         if not self._network.is_same_network(info):
             raise ConnectionError("Received incompatible advertisement frame from host")
@@ -1448,7 +1477,14 @@ class STANetwork:
                     return network, index
 
     async def _initialize_network(self) -> None:
+        self._diagnostic("authorization-start")
+        if self._advertisement_source is not None:
+            mark_authorized = getattr(self._advertisement_source, "mark_authorized", None)
+            if mark_authorized is not None:
+                await mark_authorized()
+            self._authorized = True
         await self._interface.set_authorized()
+        self._diagnostic("authorized")
 
         network = None
         # The helper is bound before the scan, so its stream can contain a
@@ -1464,6 +1500,36 @@ class STANetwork:
                 source_stats = "; external received=%d accepted=%d" % (
                     self._external_received, self._external_accepted
                 )
+                source_stats += " after-authorize=%d/%d" % (
+                    self._external_after_authorization,
+                    self._external_accepted_after_authorization,
+                )
+                source_stats += " local-participant=%d" % self._external_with_local_participant
+                stats = getattr(self._advertisement_source, "stats", None)
+                if stats is not None:
+                    source_stats += ("; helper phase=%s raw=%d radiotap=%d action=%d "
+                                     "vendor=%d decoded=%d" % (
+                        stats["phase"], stats["raw"], stats["radiotap"],
+                        stats["action"], stats["vendor"], stats["advertisement"],
+                    ))
+            if self._param.infer_address_on_timeout:
+                host = self._network.participants[0]
+                octets = host.ip_address.split(".")
+                if (self._network.num_participants == 1
+                        and self._network.max_participants >= 2
+                        and len(octets) == 4 and octets[:2] == ["169", "254"]
+                        and octets[3] == "1"):
+                    self._network_id = int(octets[2])
+                    self._participant_id = 1
+                    local_address = ".".join(octets[:3] + ["2"])
+                    broadcast_address = ".".join(octets[:3] + ["255"])
+                    await self._interface.add_address(local_address, broadcast_address)
+                    if host.connected:
+                        await self._interface.add_neighbor(
+                            host.ip_address, host.mac_address
+                        )
+                    self._diagnostic("address-inferred")
+                    return
             raise ConnectionError(
                 "Failed to obtain IP address after joining network (timeout)" + source_stats
             )
@@ -1477,6 +1543,7 @@ class STANetwork:
         local_address = network.participants[index].ip_address
         broadcast_address = f"169.254.{self._network_id}.255"
         await self._interface.add_address(local_address, broadcast_address)
+        self._diagnostic("address-configured")
 
         # Create a static neighbor entry for each participant
         for participant in network.participants:
@@ -1988,10 +2055,14 @@ async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
         )
 
     async with wlan.create_factory() as factory:
+        if param.diagnostic is not None:
+            param.diagnostic("station-connect-start")
         async with factory.connect_network(
             param.phyname, param.ifname, network.ssid.hex(), network.channel,
-            wlan_key
+            wlan_key, param.diagnostic, param.preconnect_scan
         ) as interface:
+            if param.diagnostic is not None:
+                param.diagnostic("station-created")
             sta = STANetwork(
                 interface, param, key_derivation, param.advertisement_source
             )

@@ -1215,13 +1215,15 @@ class Station(Interface):
     def __init__(
         self, wlan: nl80211.NL80211, router: route.RouteController, name: str,
         index: int, address: MACAddress, ssid: str, channel: int,
-        key: bytes | None
+        key: bytes | None, diagnostic=None, preconnect_scan: bool = False
     ):
         super().__init__(wlan, router, name, index, address)
 
         self._ssid = ssid
         self._channel = channel
         self._key = key
+        self._diagnostic = diagnostic
+        self._preconnect_scan = preconnect_scan
 
         self._host_address = None
 
@@ -1249,12 +1251,35 @@ class Station(Interface):
         complete, or raises an exception if the connection fails. Disconnects
         from the network when the context manager exits.
         """
+        if self._diagnostic is not None:
+            self._diagnostic("station-interface-up-start")
         await self.up()
+        if self._diagnostic is not None:
+            self._diagnostic("station-interface-up")
         self.disable_ipv6()
+        if self._preconnect_scan:
+            await self._scan_network()
+            await self.up()
+            if self._diagnostic is not None:
+                self._diagnostic("station-interface-restored-after-scan")
         async with self._connect_network():
             async with util.background_task(self._process_messages):
                 await self._register_frame(IEEE80211_STYPE_ACTION)
                 yield
+
+    async def _scan_network(self) -> None:
+        """Populate cfg80211's BSS cache before CONNECT when explicitly requested."""
+        if self._diagnostic is not None:
+            self._diagnostic("preconnect-scan-start")
+        result = await trio.run_process(
+            ["/usr/sbin/iw", "dev", self.name(), "scan", "freq",
+             str(Channels[self._channel])],
+            capture_stdout=True, capture_stderr=True, check=False,
+        )
+        if result.returncode:
+            raise ConnectionError("Pre-connect managed scan failed")
+        if self._diagnostic is not None:
+            self._diagnostic("preconnect-scan-complete")
 
     async def _register_key(self, key: bytes) -> None:
         """
@@ -1334,11 +1359,17 @@ class Station(Interface):
             # If no key is provided, the frames are not encrypted.
             attrs[nl80211.NL80211_ATTR_PRIVACY] = False
 
+        if self._diagnostic is not None:
+            self._diagnostic("connect-request-start")
         await self._wlan.request(nl80211.NL80211_CMD_CONNECT, attrs)
+        if self._diagnostic is not None:
+            self._diagnostic("connect-request-acked")
 
         while True:
             message = await self._wlan.receive()
             if message.type == nl80211.NL80211_CMD_CONNECT:
+                if self._diagnostic is not None:
+                    self._diagnostic("connect-event")
                 status = message.attributes[nl80211.NL80211_ATTR_STATUS_CODE]
                 if status != WLAN_STATUS_SUCCESS:
                     error = f"Connect failed with status code {status}"
@@ -1837,7 +1868,7 @@ class Factory:
     @contextlib.asynccontextmanager
     async def connect_network(
         self, phyname: str, ifname: str, ssid: str, channel: int,
-        key: bytes | None
+        key: bytes | None, diagnostic=None, preconnect_scan: bool = False
     ) -> AsyncIterator[Station]:
         """
         Creates an interface in station mode and connects it to the given SSID.
@@ -1850,7 +1881,7 @@ class Factory:
 
             sta = Station(
                 self._wlan, self._router, ifname, index, address, ssid, channel,
-                key
+                key, diagnostic, preconnect_scan
             )
             async with sta.connect():
                 yield sta

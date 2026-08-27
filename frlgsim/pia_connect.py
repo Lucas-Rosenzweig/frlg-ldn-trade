@@ -36,6 +36,7 @@ NET_UPDATE_PROPERTY_ACK = 0x51   # joiner -> host
 
 # Session(new) message types
 SESSION_JOIN_REQUEST = 0
+SESSION_JOIN_RESPONSE = 2
 SESSION_UPDATE = 5
 SESSION_LEFT_SYNC = 7
 
@@ -200,6 +201,7 @@ class ConnectionManager:
         self.info = getattr(log, "info", log)   # clean milestone sink (default-mode narration)
         self.state = ST_NET
         self._outbox = []
+        self._finalize_sent = False
         # RTT origination: clone the host's last type-0 request as our template, bump a
         # systime per originated probe. _rtt_orig_tick gates the ~6/s cadence.
         self._last_host_rtt = None
@@ -288,20 +290,26 @@ class ConnectionManager:
                 seqid = int.from_bytes(body[0:4], "big") if len(body) >= 4 else 1
                 self._q(PROTO_NET, build_net_property_ack(seqid), 0, self.our_var, False, False, True)
         elif proto == PROTO_SESSION:
-            # host ACKED our join -> finalize (Session 6, dst=host, src=ours). Finalize ONLY on the
-            # host's join-accept (Session type 5 / SESSION_UPDATE), NOT on every session message: the host
-            # sends a type-5 accept (192B) AND a type-2 follow-up (37B), and we were finalizing on both (2
-            # total) vs native's exactly ONE. Guarding on type 5 re-emits on a re-sent accept (loss
-            # recovery) but never on the type-2, matching native. STOP once CONNECTED.
+            # The host accepts a join by sending the type-5 session update; acknowledge it
+            # with type 6.  A short type-2 response can instead report a rejected join
+            # (including protocol-version mismatch), so it must never open the data path.
             s = parse_session(payload)
-            if (s and s["type"] == SESSION_UPDATE
-                    and self.host_var is not None and self.state != ST_CONNECTED):
+            if s and s["type"] == SESSION_JOIN_RESPONSE and len(payload) >= 4:
+                # The compact response identifies the selected protocol/version.
+                # Byte 3 is not documented in the primary Session-protocol page:
+                # a clean two-player join produced 1, while a lobby polluted by
+                # concurrent stale clients repeatedly produced 8. Keep it observable
+                # without assigning an unverified enum meaning.
+                self.log("Session join response: "
+                         f"protocol={payload[1]} version={payload[2]} field3={payload[3]}")
+            if (s and s["type"] == SESSION_UPDATE and self.host_var is not None
+                    and not self._finalize_sent):
                 self._q(PROTO_SESSION, build_session_finalize(self.our_mac),
                         self.host_var, self.our_var, False, True, False)
-            if self.state == ST_NET:
+                self._finalize_sent = True
+                self.log("Session update (type 5) -> queued update ack (type 6)")
+            if s and s["type"] == SESSION_UPDATE and self.state == ST_NET:
                 self.state = ST_FINALIZE
-                self.log("host acked join (Session) -> FINALIZE")
-                self.info("Host acknowledged our join.")
         elif proto in (PROTO_RTT, PROTO_RELIABLE):
             if self.state == ST_FINALIZE:
                 self.state = ST_CONNECTED

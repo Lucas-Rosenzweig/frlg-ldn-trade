@@ -6,16 +6,18 @@ Cette page sépare les observations établies des hypothèses encore à tester.
 Une capture positive sur le chemin monitor ne localise pas à elle seule
 l’étage exact du filtrage dans l’interface station.
 
-## Modèle de panne reproduite
+## Modèle de panne et contournement reproduits
 
 ```text
 scan monitor -> annonce LDN reçue et décodée
-association  -> réussie assez loin pour attendre la mise à jour réseau
+scan géré    -> peuple le cache BSS, puis CONNECT produit l'association
 post-join    -> aucune annonce exploitable sur le chemin nl80211 de la station
-timeout      -> Failed to obtain IP address after joining network (timeout)
+attente 10 s -> aucune annonce externe avec le participant local
+garde stricte-> inférence de 169.254.X.2
+PIA/RFU      -> échange complet possible
 ```
 
-Ce message n’indique pas un échec DHCP classique. Dans `ldn==0.0.17`,
+Le timeout historique n’indique pas un échec DHCP classique. Dans `ldn==0.0.17`,
 `Network._initialize_network()` autorise d’abord la station, attend pendant une
 seconde une advertisement contenant la MAC locale, puis configure l’adresse IP
 extraite de cette advertisement. Le flux provient des Action Frames reçues par
@@ -41,9 +43,11 @@ deux faits ne prouvent pas encore à quel étage les trames sont perdues.
   `ldn/wlan.py:Interface._register_frame()` avec `NL80211_CMD_REGISTER_FRAME`,
   `IFINDEX`, `FRAME_TYPE` et `FRAME_MATCH`, sans `RECEIVE_MULTICAST`.
 - La dépendance contient déjà une classe `Monitor` utilisant
-  `AF_PACKET/SOCK_RAW` et des trames radiotap. C’est une brique possible pour
-  un contournement userspace, pas encore une solution intégrée.
-- Le dépôt n’a actuellement aucune suite de tests automatisés versionnée.
+  `AF_PACKET/SOCK_RAW` et des trames radiotap. Le contournement intégré utilise
+  désormais ce type de chemin via un helper séparé et un IPC Unix privé.
+- Le dépôt possède six tests unitaires centrés sur le protocole IPC du helper.
+  Il n’existe toujours pas de suite automatisée couvrant l’association LDN,
+  PIA/RFU ou un échange matériel complet.
 
 ### Résultats monitor et fork userspace
 
@@ -65,8 +69,25 @@ deux faits ne prouvent pas encore à quel étage les trames sont perdues.
 - Le helper IPC séparé démarre, remet des advertisements au fork et ceux-ci
   passent la revalidation d’identité. Sur les essais actuels, seules les
   advertisements pré-autorisation sont reçues : aucune ne contient le
-  participant local, même après une attente de 10 s. Le correctif n’est donc
-  pas encore validé sur AX200.
+  participant local, même après une attente de 10 s.
+- Un scan géré ciblé avant `NL80211_CMD_CONNECT` est nécessaire sur l’AX200
+  testée : il peuple le cache BSS et permet à la requête CONNECT, pourtant déjà
+  acquittée auparavant, de produire l’événement d’association.
+- Le 2026-08-27, un essai unique sur salon neuf a terminé l’association,
+  l’authentification LDN, l’inférence gardée de `169.254.X.2`, la négociation
+  PIA, `JOIN_GROUP_OK`, l’échange RFU complet et la fermeture propre. Le
+  Pokémon reçu a été écrit en `.pk3` de 100 octets avec checksum valide.
+- Plusieurs anciens processus live lancés via `pkexec` étaient restés actifs
+  après des interruptions envoyées seulement au shell appelant. Ils causaient
+  des refus PIA répétés ; tuer explicitement tous les enfants privilégiés puis
+  recréer le salon a supprimé cette interférence.
+- La réponse Session compacte type 2 ne suffit pas à établir la connexion. Sur
+  l’essai réussi, le host a envoyé une mise à jour type 5, le client a mis en
+  file son ack type 6, puis l’arrivée de RTT/Reliable a établi la connexion.
+- La réponse compacte type 2 a annoncé `protocol=13`, `version=7`. Son quatrième
+  octet valait 1 sur le salon propre réussi et 8 sur le salon pollué. La
+  sémantique de ce champ n’est pas établie par la documentation primaire ; ne
+  pas le nommer comme un code d’erreur sans preuve supplémentaire.
 
 ### Machine de reproduction communiquée le 2026-08-26
 
@@ -110,10 +131,14 @@ Ne pas transformer les points suivants en faits sans nouvelle capture :
 - Un routage hybride « association via station, advertisements via monitor »
   est plausible parce que LDN sait déjà parser les trames monitor, mais il faut
   vérifier coexistence, canal, doublons, cycle de vie et nettoyage des VIF.
+- L’adresse `.2` inférée est correcte pour les sessions observées et a permis
+  un échange, mais sa généralité sur d’autres tailles/topologies de session
+  reste à établir. La garde actuelle refuse les cas ambigus.
 
 ## Conclusion autorisée à ce stade
 
-Le chemin RX brut monitor est alimenté après association et le décodeur LDN
-peut traiter des advertisements sur ce chemin. Cela justifie de valider le
-contournement userspace avant toute modification noyau ou toute annonce de
-capability. Cela ne constitue pas encore une correction live complète.
+Le contournement userspace a permis un premier échange live complet sur AX200.
+Il reste expérimental : l’adresse locale est inférée parce que l’annonce qui
+devrait la fournir n’est toujours pas reçue après autorisation. Il faut encore
+deux répétitions AX200 et un contrôle avec un adaptateur connu fonctionnel
+avant de déclarer la correction validée sans régression.

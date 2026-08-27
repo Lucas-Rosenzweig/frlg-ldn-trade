@@ -21,6 +21,8 @@ experiment order, and evidence to capture.
   fork in `vendor/ldn`; `python-netlink` remains an installed dependency.
 - `docs/ax200-support/index.md`: AX200 dossier entry point and current status.
 - `docs/ax200-support/findings.md`: verified facts, evidence, and hypotheses.
+- `docs/ax200-support/first-success.md`: reproducible report and timeline for
+  the first complete AX200 trade on 2026-08-27.
 - `docs/ax200-support/baseline.md`: reproducible environment and safeguards.
 - `docs/ax200-support/procedure.md`: hardware procedure and acceptance checks.
 - `docs/ax200-support/decisions.md`: experiment decision tree and fix surfaces.
@@ -63,6 +65,8 @@ For Python changes:
 ./venv/bin/python frlgtrade.py --help >/dev/null
 ```
 
-There is no committed automated test suite. Live AX200 acceptance requires the
-hardware procedure in `docs/ax200-support/procedure.md`; never claim the issue
-fixed from offline checks alone.
+The repository has a small monitor-helper IPC unittest module, but no complete
+automated trade suite. Live AX200 acceptance requires the hardware procedure
+in `docs/ax200-support/procedure.md`; never claim the issue fixed from offline
+checks alone. One complete trade succeeded on 2026-08-27; two further AX200
+runs and a known-good-adapter control are still required.

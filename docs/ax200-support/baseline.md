@@ -16,7 +16,7 @@ utiliser `origin` pour le fork personnel.
 git status --short --branch
 git rev-parse HEAD
 uname -a
-sudo ethtool -i wlan0
+pkexec ethtool -i wlan0
 iw phy
 ./venv/bin/python -m pip freeze
 ```
@@ -38,6 +38,29 @@ Référence communiquée le 2026-08-26 :
 
 Les détails techniques et les limites d’interprétation sont regroupés dans
 [findings.md](findings.md).
+
+## Baseline du premier succès fonctionnel
+
+Le premier échange complet du 2026-08-27 a utilisé :
+
+- application de base `3c46554` avec modifications locales ;
+- kernel `7.2.0-1-cachyos` ;
+- firmware `77.aa2dd297.0 cc-a0-77.ucode` ;
+- `ldn 0.0.17` via `vendor/ldn` ;
+- `python-netlink 0.0.15` et `trio 0.33.0` ;
+- `phy0`, AX200/`iwlmvm`, `mon0` sur canal 11 ;
+- NetworkManager arrêté pendant l’essai et restauré ensuite.
+
+Le compte rendu complet est dans [first-success.md](first-success.md).
+
+Avant toute répétition, noter aussi les processus privilégiés :
+
+```bash
+pgrep -af 'frlgtrade.py --live|frlgsim.monitor_helper'
+```
+
+Un shell interrompu ne garantit pas que son enfant lancé via `pkexec` est mort.
+Plusieurs enfants live simultanés rendent l’expérience invalide.
 
 ## Révisions locales à identifier
 
